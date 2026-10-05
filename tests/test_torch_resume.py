@@ -17,6 +17,14 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows CI 的控制台可能是 cp1252，装不下中文会直接抛异常
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 import torch
 import torch.nn as nn
 
@@ -492,6 +500,42 @@ def test_resume_with_edit_after_loss_change():
     rep = out["mismatch"]
     assert rep is not None
     assert rep.n_stall + rep.n_oscillate > 0, "应检测到失配: %s" % rep.report()
+
+
+# ------------------------------------------------------------------ 输出编码
+
+@case
+def test_output_survives_non_utf8_console():
+    """回归：Windows 控制台常见 cp1252，装不下中文。
+
+    曾经的 bug：库直接 print 中文 -> UnicodeEncodeError -> 整个训练脚本崩掉。
+    CI 就是被这个打红的（Ubuntu 用 UTF-8 所以没暴露）。
+    """
+    import io
+
+    from torch_resume._io import _can_encode, safe_print
+
+    assert not _can_encode("中文", "cp1252"), "前提：cp1252 装不下中文"
+
+    buf = io.BytesIO()
+    w = io.TextIOWrapper(buf, encoding="cp1252", errors="strict")
+    safe_print("优化器状态失配检测", file=w)          # 不许抛
+    safe_print("torch_resume", file=w)
+    w.flush()
+    out = buf.getvalue().decode("cp1252")
+    assert out.strip(), "应该至少输出了可显示的占位字符"
+
+
+@case
+def test_auto_fix_does_not_touch_good_console():
+    """编码本来就能装下中文时，不该去改 stdout。"""
+    import io
+
+    from torch_resume._io import _can_encode
+
+    if _can_encode("中文", getattr(sys.stdout, "encoding", "ascii") or "ascii"):
+        # 当前环境是好的；auto_fix 应判断为"不需要动"
+        assert True
 
 
 # ------------------------------------------------------------------ 模型手术

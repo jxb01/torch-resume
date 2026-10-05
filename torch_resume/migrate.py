@@ -15,6 +15,7 @@ import torch
 
 from .plan import MigrationPlan, diff
 from .state import name_map, opt_state_by_name
+from ._io import safe_print
 
 
 @dataclass
@@ -137,7 +138,7 @@ def migrate(
     plan = diff(new_model, old_state, allow_rename=allow_rename,
                 partial_min_ratio=partial_min_ratio)
     if verbose:
-        print(plan.report())
+        safe_print(plan.report())
     # 必须用计划里那一份预处理过的旧权重（键已按手术记录重命名/复制）
     st = apply_plan(new_model, plan, plan.old_state if plan.old_state is not None
                     else old_state)
@@ -146,6 +147,6 @@ def migrate(
     st.opt_migrated, st.opt_reset = st2.opt_migrated, st2.opt_reset
     st.plan = plan
     if verbose:
-        print("-" * 66)
-        print(st.report())
+        safe_print("-" * 66)
+        safe_print(st.report())
     return st

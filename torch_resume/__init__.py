@@ -28,6 +28,7 @@
                         loss_fn=my_loss, batches=sample_batches,
                         warmup={"fresh": 500, "mismatched": 200})
 """
+from ._io import auto_fix as _auto_fix, enable_utf8, safe_print
 from .checkpoint import Checkpoint
 from .groups import (
     KIND_FRESH,
@@ -63,7 +64,11 @@ from .surgery import (
     widen,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
+
+# Windows 控制台默认不是 UTF-8；只有在确实装不下中文时才自动切换，
+# 正常的环境一行都不动。想禁用：TORCH_RESUME_NO_UTF8=1
+_auto_fix()
 
 __all__ = [
     # 检查点
@@ -84,4 +89,6 @@ __all__ = [
     "freeze_module", "clone_model", "describe_surgery",
     # 状态工具
     "capture_rng", "restore_rng", "clone_tree", "name_map", "opt_state_by_name",
+    # 输出编码
+    "enable_utf8", "safe_print",
 ]

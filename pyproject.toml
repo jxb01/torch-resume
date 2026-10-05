@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-resume"
-version = "0.2.0"
+version = "0.2.1"
 description = "Change your model structure or loss mid-training and keep going -- without starting over."
 readme = "README.md"
 requires-python = ">=3.9"

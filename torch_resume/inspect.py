@@ -13,6 +13,7 @@ import torch
 from .groups import PlanWarmup, group_report, retag_groups
 from .migrate import MigrateStats, migrate
 from .mismatch import MismatchReport, detect_mismatch
+from ._io import safe_print
 
 
 # ---------------------------------------------------------------- 查看
@@ -58,12 +59,12 @@ def param_table(model: torch.nn.Module, pattern: Optional[str] = None) -> List[P
 def print_params(model: torch.nn.Module, pattern: Optional[str] = None) -> None:
     rows = param_table(model, pattern)
     if not rows:
-        print("  (无匹配参数)")
+        safe_print("  (无匹配参数)")
         return
     for r in rows:
-        print(r.line())
+        safe_print(r.line())
     total = sum(1 for _ in model.parameters())
-    print("  --- 匹配 %d / 共 %d 个参数 ---" % (len(rows), total))
+    safe_print("  --- 匹配 %d / 共 %d 个参数 ---" % (len(rows), total))
 
 
 # ---------------------------------------------------------------- 改
@@ -134,12 +135,12 @@ def resume_with_edit(
         rep = detect_mismatch(new_model, new_optimizer, loss_fn, batches,
                               threshold=threshold)
         if verbose:
-            print(rep.report())
+            safe_print(rep.report())
         n = rep.apply(new_optimizer, policy=policy)
         if verbose:
-            print("[失配处理] 策略=%s，已重置 %d 个参数的 exp_avg_sq" % (policy, n))
+            safe_print("[失配处理] 策略=%s，已重置 %d 个参数的 exp_avg_sq" % (policy, n))
     elif verbose:
-        print("[失配检测] 跳过（未提供 loss_fn / batches）"
+        safe_print("[失配检测] 跳过（未提供 loss_fn / batches）"
               " —— 换过 loss 的话强烈建议补上")
 
     # 分组与 warmup：把前面的"建议"真正落地
@@ -149,12 +150,12 @@ def resume_with_edit(
         retag_groups(new_optimizer, new_model, st.plan, mismatch=applied,
                      lr_by_kind=lr_by_kind, base_lr=base_lr)
         if verbose:
-            print(group_report(new_optimizer))
+            safe_print(group_report(new_optimizer))
     if warmup:
         sched = PlanWarmup(new_optimizer, warmup, start_factor=start_factor)
         if verbose:
-            print(sched.report())
-            print("[提示] 训练循环里记得调用 scheduler.step()")
+            safe_print(sched.report())
+            safe_print("[提示] 训练循环里记得调用 scheduler.step()")
 
     return {"migrate": st, "mismatch": rep, "scheduler": sched,
             "groups": new_optimizer.param_groups}
@@ -188,10 +189,10 @@ class Inspector:
         head = "%s" % self.title
         if self.step is not None:
             head += "（step %s）" % self.step
-        print("=" * 66)
-        print(head)
-        print("=" * 66)
-        print(HELP)
+        safe_print("=" * 66)
+        safe_print(head)
+        safe_print("=" * 66)
+        safe_print(HELP)
 
     def execute(self, line: str) -> bool:
         """执行一条命令。返回 False 表示退出。"""
@@ -203,18 +204,18 @@ class Inspector:
         if cmd in ("resume", "exit", "quit", "q", "done"):
             return False
         if cmd == "help":
-            print(HELP)
+            safe_print(HELP)
         elif cmd in ("list", "ls", "show"):
             print_params(self.model, args[0] if args else None)
         elif cmd == "set":
             if len(args) < 2:
-                print("  用法: set <名字> <数值>")
+                safe_print("  用法: set <名字> <数值>")
             else:
                 set_param(self.model, args[0], float(args[1]))
-                print("  已设置 %s = %s" % (args[0], args[1]))
+                safe_print("  已设置 %s = %s" % (args[0], args[1]))
         elif cmd == "zero":
             if not args:
-                print("  用法: zero <正则>")
+                safe_print("  用法: zero <正则>")
             else:
                 n = 0
                 with torch.no_grad():
@@ -222,18 +223,18 @@ class Inspector:
                         if re.search(args[0], name):
                             p.zero_()
                             n += 1
-                print("  已置零 %d 个参数" % n)
+                safe_print("  已置零 %d 个参数" % n)
         elif cmd in ("freeze", "unfreeze"):
             if not args:
-                print("  用法: %s <正则>" % cmd)
+                safe_print("  用法: %s <正则>" % cmd)
             else:
                 n = freeze(self.model, args[0], cmd == "freeze")
-                print("  已处理 %d 个参数" % n)
+                safe_print("  已处理 %d 个参数" % n)
         elif cmd == "nan":
             bad = [r.name for r in param_table(self.model) if r.nan > 0]
-            print("  含 NaN 的参数: %s" % (bad if bad else "无"))
+            safe_print("  含 NaN 的参数: %s" % (bad if bad else "无"))
         else:
-            print("  未知命令: %s（help 看帮助）" % cmd)
+            safe_print("  未知命令: %s（help 看帮助）" % cmd)
         return True
 
     def pause(self) -> None:
@@ -243,11 +244,11 @@ class Inspector:
             try:
                 line = input("ail> ")
             except (EOFError, KeyboardInterrupt):
-                print()
+                safe_print()
                 break
             if not self.execute(line):
                 break
-        print("[resume] 继续训练")
+        safe_print("[resume] 继续训练")
 
     def run_script(self, lines: Iterable[str]) -> None:
         """非交互：按脚本执行。
@@ -256,7 +257,7 @@ class Inspector:
         """
         self.banner()
         for line in lines:
-            print("ail> %s" % line)
+            safe_print("ail> %s" % line)
             if not self.execute(line):
                 return
 

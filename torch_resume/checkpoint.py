@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 
 from .state import capture_rng, clone_tree, restore_rng
+from ._io import safe_print
 
 CKPT_EXT = ".ailck"
 WEIGHT_EXT = ".ailw"
@@ -102,12 +103,12 @@ class Checkpoint:
         used = self._used_gb() + size_hint
         if used > self.disk_limit_gb:
             if self.verbose:
-                print("[checkpoint] 磁盘限额 %.2f GB 已用 %.2f GB，先清理"
+                safe_print("[checkpoint] 磁盘限额 %.2f GB 已用 %.2f GB，先清理"
                       % (self.disk_limit_gb, used))
             self._prune(force=True)
             used = self._used_gb() + size_hint
             if used > self.disk_limit_gb:
-                print("[checkpoint] 警告：仍超出限额，本次跳过保存")
+                safe_print("[checkpoint] 警告：仍超出限额，本次跳过保存")
                 return False
         return True
 
@@ -124,7 +125,7 @@ class Checkpoint:
                 try:
                     _atomic_torch_save(payload, path)
                 except Exception as e:      # 保存失败不能让训练崩
-                    print("[checkpoint] 保存失败 %s: %s" % (path.name, e))
+                    safe_print("[checkpoint] 保存失败 %s: %s" % (path.name, e))
 
         self._worker = threading.Thread(target=run, daemon=True)
         self._worker.start()
@@ -197,7 +198,7 @@ class Checkpoint:
                 self._save_index()
             saved = p
             if self.verbose:
-                print("[checkpoint] 阶段性保存 step=%d -> %s" % (step, p.name))
+                safe_print("[checkpoint] 阶段性保存 step=%d -> %s" % (step, p.name))
 
         if want_best:
             is_better = (len(self._best) < self.best) or self._better(
@@ -214,7 +215,7 @@ class Checkpoint:
                     self._save_index()
                 saved = saved or p
                 if self.verbose:
-                    print("[checkpoint] 最优更新 %s=%.6f step=%d -> %s"
+                    safe_print("[checkpoint] 最优更新 %s=%.6f step=%d -> %s"
                           % (self.monitor, metric, step, p.name))
                 if self.export_weights:
                     self._export_weights(payload, p.with_suffix(WEIGHT_EXT))
@@ -231,7 +232,7 @@ class Checkpoint:
         try:
             _atomic_torch_save({"model": payload["model"], "step": payload["step"]}, path)
         except Exception as e:
-            print("[checkpoint] 导出纯权重失败: %s" % e)
+            safe_print("[checkpoint] 导出纯权重失败: %s" % e)
 
     # ---------------- 保留策略 ----------------
 
