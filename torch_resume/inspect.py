@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
 
+from .groups import PlanWarmup, group_report, retag_groups
 from .migrate import MigrateStats, migrate
 from .mismatch import MismatchReport, detect_mismatch
 
@@ -102,16 +103,26 @@ def resume_with_edit(
     policy: str = "threshold",
     allow_rename: bool = False,
     partial_min_ratio: float = 0.5,
+    warmup: Optional[Dict[str, int]] = None,
+    lr_by_kind: Optional[Dict[str, float]] = None,
+    base_lr: Optional[float] = None,
+    start_factor: float = 0.1,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """改完结构 / 改完 loss 之后，一条命令接着训。
 
-    做三件事：
+    做四件事：
       1. 结构 diff + 权重继承（未改动的保留，改动的用新模型自己的初始化）
       2. 优化器状态迁移（含 Adam 动量；部分继承的参数按切片迁动量）
       3. 若给了 loss_fn 与 batches，用新 loss 试算一次，做**失配检测**并按策略处理
+      4. 若给了 warmup / lr_by_kind，按参数类别重新分组并挂上 warmup 调度器
 
-    Returns: {"migrate": MigrateStats, "mismatch": MismatchReport | None}
+    Args:
+        warmup: {"fresh": 500, "mismatched": 200} —— 各类别预热多少步
+        lr_by_kind: {"fresh": 2.0} —— 各类别相对基准 lr 的倍数
+        base_lr: 基准 lr，默认取优化器当前的
+
+    Returns: {"migrate", "mismatch", "scheduler", "groups"}
     """
     st: MigrateStats = migrate(
         new_model, new_optimizer, old_model, old_optimizer,
@@ -131,7 +142,22 @@ def resume_with_edit(
         print("[失配检测] 跳过（未提供 loss_fn / batches）"
               " —— 换过 loss 的话强烈建议补上")
 
-    return {"migrate": st, "mismatch": rep}
+    # 分组与 warmup：把前面的"建议"真正落地
+    sched = None
+    applied = rep if (rep is not None and policy != "none") else None
+    if warmup or lr_by_kind:
+        retag_groups(new_optimizer, new_model, st.plan, mismatch=applied,
+                     lr_by_kind=lr_by_kind, base_lr=base_lr)
+        if verbose:
+            print(group_report(new_optimizer))
+    if warmup:
+        sched = PlanWarmup(new_optimizer, warmup, start_factor=start_factor)
+        if verbose:
+            print(sched.report())
+            print("[提示] 训练循环里记得调用 scheduler.step()")
+
+    return {"migrate": st, "mismatch": rep, "scheduler": sched,
+            "groups": new_optimizer.param_groups}
 
 
 # ---------------------------------------------------------------- 交互式

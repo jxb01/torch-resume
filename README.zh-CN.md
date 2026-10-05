@@ -43,7 +43,9 @@ pip install git+https://github.com/jxb01/torch-resume.git
 | `diff` / `migrate` | 改结构后继承权重与**优化器状态**（含 Adam 动量） |
 | `detect_mismatch` | 换 loss 后**先试算再改**：逐参数比对 sqrt(v) 与新梯度，报告并处理 |
 | `Inspector` / `pause` | 暂停、看每个参数的统计、直接改权重、冻结/解冻 |
-| `resume_with_edit` | 上面三件事的一条命令版本 |
+| `widen` / `replace_module` / `insert_after` / `duplicate_layer` | 模型手术：改结构不用重写模型 |
+| `retag_groups` / `PlanWarmup` | 按参数类别分组，对全新/失配的参数自动预热 |
+| `resume_with_edit` | 上面几件事的一条命令版本 |
 
 ---
 
@@ -59,11 +61,22 @@ for step, (xb, yb) in enumerate(loader):
     loss = train_step(xb, yb)
     ck.step(step, model, opt, metrics={"val_loss": loss.item()})
 
-# 2) 改了模型结构，接着训
-tr.resume_with_edit(old_model, old_opt, new_model, new_opt,
-                    loss_fn=my_loss, batches=sample_batches)
+# 2) 把隐藏层加宽 —— 一行；已经训好的模型原样不动
+new_model = tr.widen(model, "0", 128)
+new_opt = torch.optim.Adam(new_model.parameters(), lr=1e-3)
 
-# 3) 或者暂停进去看看
+# 3) 接着训：权重和优化器状态一起继承，再按类别预热
+out = tr.resume_with_edit(
+    model, opt, new_model, new_opt,
+    loss_fn=my_loss, batches=sample_batches,
+    warmup={"fresh": 500, "mismatched": 200},
+    lr_by_kind={"fresh": 2.0})
+
+for step, (xb, yb) in enumerate(loader):
+    ...
+    out["scheduler"].step()        # 在 optimizer.step() 之后
+
+# 4) 或者暂停进去看看
 tr.pause(model, step=1200)
 ```
 
@@ -92,6 +105,56 @@ tr.pause(model, step=1200)
   汇总: 停滞=4  震荡=0  非有限=0  正常=0  共=4
   建议: 对失配参数重置 exp_avg_sq，并加 warmup
 ```
+
+---
+
+## 模型手术
+
+改一层不用重写整个模型。
+
+```python
+new = tr.widen(model, "0", 128)                    # 加宽 + 同步加宽下游 + 中间夹的 norm
+new = tr.replace_module(model, "encoder.layer.3", my_layer)
+new = tr.insert_after(model, "blocks.2", blk)      # 下标位移，重命名映射自动算好
+new = tr.duplicate_layer(model, "blocks.1", n=2)   # 扩深；新份直接复制原层权重
+```
+
+每次都返回**新模型**（旧的留着做迁移对比），并记录做过什么：
+
+```
+模型手术记录
+  widen 0: 64 -> 128（下游 2）
+  显式继承: 4 项
+```
+
+这份记录让迁移能把两边对上 —— **没有记录就不猜**。
+
+---
+
+## 自动 warmup
+
+以前 `detect_mismatch` 只是"建议加 warmup"，现在库自己执行：
+
+```python
+out = tr.resume_with_edit(..., warmup={"fresh": 500, "mismatched": 200},
+                          lr_by_kind={"fresh": 2.0})
+```
+
+参数按"实际发生了什么"重新分组，每组有自己的调度：
+
+```
+参数分组
+  fresh        lr=6.000e-03   4 个   权重从零初始化
+  mismatched   lr=3.000e-03   3 个   优化器状态被重置
+  kept         lr=3.000e-03   1 个   完全继承
+
+warmup 计划
+  fresh        lr=6.000e-04   4 个   预热 500 步
+  mismatched   lr=3.000e-04   3 个   预热 200 步
+  kept         lr=3.000e-03   1 个   不预热
+```
+
+`retag_groups` **不会动 `optimizer.state`**（它按参数对象索引），所以刚迁移过来的动量还在。
 
 ---
 
@@ -137,7 +200,7 @@ beta2 = 0.999 时约 **1000 步**，期间它是"旧世界的统计量"。
 git clone https://github.com/jxb01/torch-resume.git
 cd torch-resume
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-python tests/test_torch_resume.py     # 23 项
+python tests/test_torch_resume.py     # 35 项
 python examples/demo.py               # 端到端演示
 ```
 
@@ -150,12 +213,14 @@ python examples/demo.py               # 端到端演示
 ```
 torch_resume/
   state.py       RNG 快照、参数名映射、递归克隆
-  plan.py        结构对比 -> 迁移计划（含重叠比例门槛）
+  plan.py        结构对比 -> 迁移计划（重叠比例门槛 + 手术记录）
   migrate.py     执行迁移（权重 + 优化器状态）
   mismatch.py    失配检测（试算 + 逐参数报告 + 处理）
+  groups.py      按类别重新分组 + PlanWarmup 调度器
+  surgery.py     widen / replace_module / insert_after / duplicate_layer
   checkpoint.py  强制检查点
   inspect.py     暂停 / 查看 / 修改 / resume_with_edit
-tests/test_torch_resume.py     23 项测试
+tests/test_torch_resume.py     35 项测试
 examples/demo.py               端到端演示
 ```
 

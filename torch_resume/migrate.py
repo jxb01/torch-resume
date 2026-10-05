@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from .plan import MigrationPlan
+
 import torch
 
 from .plan import MigrationPlan, diff
@@ -24,6 +26,8 @@ class MigrateStats:
     dropped: int = 0
     opt_migrated: int = 0
     opt_reset: int = 0
+    # 本次用的迁移计划。分组和 warmup 需要它来判断每个参数的类别。
+    plan: Optional[MigrationPlan] = None
 
     def report(self) -> str:
         return ("权重: 保留=%d 部分继承=%d 重命名=%d 重置=%d 删除=%d\n"
@@ -134,10 +138,13 @@ def migrate(
                 partial_min_ratio=partial_min_ratio)
     if verbose:
         print(plan.report())
-    st = apply_plan(new_model, plan, old_state)
+    # 必须用计划里那一份预处理过的旧权重（键已按手术记录重命名/复制）
+    st = apply_plan(new_model, plan, plan.old_state if plan.old_state is not None
+                    else old_state)
     st2 = migrate_optimizer(
         new_model, new_optimizer, opt_state_by_name(old_model, old_optimizer), plan)
     st.opt_migrated, st.opt_reset = st2.opt_migrated, st2.opt_reset
+    st.plan = plan
     if verbose:
         print("-" * 66)
         print(st.report())

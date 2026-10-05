@@ -494,6 +494,226 @@ def test_resume_with_edit_after_loss_change():
     assert rep.n_stall + rep.n_oscillate > 0, "应检测到失配: %s" % rep.report()
 
 
+# ------------------------------------------------------------------ 模型手术
+
+@case
+def test_surgery_widen_keeps_trained():
+    """加宽隐藏层：已训练的行必须原样保留，旧的模型不能被动过。"""
+    a = mlp([8, 64, 4])
+    oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+    train_steps(a, oa, n=8)
+
+    b = tl.widen(a, "0", 128)
+
+    assert a[0].weight.shape == (64, 8), "widen 不该改动原模型"
+    assert b[0].weight.shape == (128, 8)
+    assert torch.equal(b[0].weight[:64], a[0].weight.detach())
+    assert b[2].weight.shape == (4, 128)
+    assert torch.equal(b[2].weight[:, :64], a[2].weight.detach())
+
+    # 迁移时应当被认定为显式继承，不受重叠比例门槛限制
+    ob = torch.optim.Adam(b.parameters(), lr=1e-3)
+    st = tl.migrate(b, ob, a, oa, verbose=False)
+    assert st.partial >= 2, "加宽后的层应做切片继承: %s" % st.report()
+    assert st.reset == 0, "不该有参数被重置: %s" % st.report()
+
+
+@case
+def test_surgery_widen_resizes_norm():
+    """中间夹了 LayerNorm 也要跟着变宽。"""
+    a = nn.Sequential(nn.Linear(8, 64), nn.ReLU(), nn.LayerNorm(64), nn.Linear(64, 4))
+    b = tl.widen(a, "0", 128)
+    assert b[0].weight.shape == (128, 8)
+    assert tuple(b[2].normalized_shape) == (128,)
+    assert b[3].weight.shape == (4, 128)
+
+
+@case
+def test_surgery_widen_rejects_bad_input():
+    a = mlp([8, 16, 4])
+    try:
+        tl.widen(a, "0", 8)          # 没有变大
+        raise AssertionError("应该报错")
+    except ValueError:
+        pass
+    try:
+        tl.widen(a, "1", 32)         # ReLU 不是 Linear
+        raise AssertionError("应该报错")
+    except TypeError:
+        pass
+
+
+@case
+def test_surgery_replace_module():
+    a = mlp([8, 16, 4])
+    oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+    train_steps(a, oa, n=4)
+    b = tl.replace_module(a, "0", nn.Linear(8, 16))
+    assert torch.equal(b[0].weight.detach(), a[0].weight.detach()), \
+        "形状一致时迁移应逐位保留"
+    plan = tl.diff(b, a.state_dict())
+    assert plan.summary.get("keep", 0) == 4, plan.summary
+
+
+@case
+def test_surgery_insert_after_renames():
+    """在 Sequential 中间插入一层，后面的下标位移要能被自动对齐。"""
+    a = mlp([8, 16, 4])          # [Linear(8,16), ReLU, Linear(16,4)]
+    oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+    train_steps(a, oa, n=4)
+
+    b = tl.insert_after(a, "1", nn.ReLU())   # 变成 [L, ReLU, ReLU, L]
+    assert len(b) == 4 and isinstance(b[2], nn.ReLU)
+
+    plan = tl.diff(b, a.state_dict())
+    assert plan.summary.get("keep", 0) == 4, "位移应被正确对齐: %s" % plan.summary
+    assert not plan.summary.get("reset"), "不该有参数被重置: %s" % plan.summary
+
+
+@case
+def test_surgery_duplicate_layer_copies_weights():
+    """扩深的份必须复制原层权重，而不是随机初始化。"""
+    torch.manual_seed(0)
+    a = nn.Sequential(nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 4)).to(DEV)
+    oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+    train_steps(a, oa, n=6)
+
+    b = tl.duplicate_layer(a, "0", 1)     # [L, L, ReLU, L]
+    assert len(b) == 4
+    plan = tl.diff(b, a.state_dict())
+    assert not plan.summary.get("reset"), "复制来的份不该被重置: %s" % plan.summary
+
+    # 迁移后，第 1 层应当与第 0 层逐位相同
+    ob = torch.optim.Adam(b.parameters(), lr=1e-3)
+    tl.migrate(b, ob, a, oa, verbose=False)
+    assert torch.equal(b[1].weight.detach(), b[0].weight.detach())
+
+
+@case
+def test_surgery_describe():
+    a = mlp([8, 64, 4])
+    b = tl.widen(a, "0", 128)
+    txt = tl.describe_surgery(b)
+    assert "widen" in txt, txt
+
+
+# ------------------------------------------------------------------ 分组与预热
+
+@case
+def test_groups_classify():
+    plan = tl.MigrationPlan(actions=[
+        tl.Action("0.weight", "keep", ""), tl.Action("0.bias", "keep", ""),
+        tl.Action("2.weight", "partial", ""), tl.Action("2.bias", "reset", ""),
+    ])
+    m = mlp([8, 16, 4])
+    kind = tl.classify(m, plan)
+    assert kind["0.weight"] == tl.KIND_KEPT
+    assert kind["2.weight"] == tl.KIND_PARTIAL
+    assert kind["2.bias"] == tl.KIND_FRESH
+
+
+@case
+def test_groups_retag_preserves_optimizer_state():
+    """重新分组不能丢掉已迁移的动量。"""
+    a = mlp([8, 16, 4])
+    oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+    train_steps(a, oa, n=6)
+    b = mlp([8, 16, 4, 2])
+    ob = torch.optim.Adam(b.parameters(), lr=1e-3)
+    st = tl.migrate(b, ob, a, oa, verbose=False)
+
+    before = {id(p): ob.state[p]["exp_avg"].clone()
+              for p in b.parameters() if p in ob.state}
+    groups = tl.retag_groups(ob, b, st.plan, lr_by_kind={"fresh": 2.0})
+    assert len(groups) >= 2, "应当分出 fresh 和 kept 两组"
+    for p in b.parameters():
+        if id(p) in before:
+            assert torch.equal(ob.state[p]["exp_avg"], before[id(p)]), \
+                "重新分组不该动 optimizer.state"
+
+
+@case
+def test_warmup_ramps_lr():
+    m = mlp([8, 16, 4])
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3)
+    plan = tl.MigrationPlan(actions=[
+        tl.Action("0.weight", "reset", ""), tl.Action("0.bias", "reset", ""),
+        tl.Action("2.weight", "keep", ""), tl.Action("2.bias", "keep", ""),
+    ])
+    tl.retag_groups(opt, m, plan, lr_by_kind={"fresh": 2.0})
+    fresh = [g for g in opt.param_groups if g["plan_kind"] == tl.KIND_FRESH][0]
+    assert abs(fresh["lr"] - 2e-3) < 1e-12, fresh["lr"]
+
+    sched = tl.PlanWarmup(opt, {"fresh": 10}, start_factor=0.1)
+    assert abs(fresh["lr"] - 2e-4) < 1e-12, "起点应是基准的 0.1 倍: %s" % fresh["lr"]
+    for _ in range(10):
+        sched.step()
+    assert abs(fresh["lr"] - 2e-3) < 1e-9, "10 步后应回到基准: %s" % fresh["lr"]
+    assert "fresh" in sched.report()
+
+
+@case
+def test_resume_with_edit_warmup_end_to_end():
+    """完整流程：加宽 -> 迁移 -> 分组 -> 预热 -> 续训不炸。"""
+    a = mlp([8, 64, 4])
+    oa = torch.optim.Adam(a.parameters(), lr=3e-3)
+    train_steps(a, oa, n=30)
+
+    b = tl.widen(a, "0", 128)
+    ob = torch.optim.Adam(b.parameters(), lr=3e-3)
+    x = torch.randn(32, 8, device=DEV)
+    y = torch.randn(32, 4, device=DEV)
+
+    def loss_fn(mm, batch):
+        return ((mm(batch[0]) - batch[1]) ** 2).mean()
+
+    out = tl.resume_with_edit(a, oa, b, ob, loss_fn=loss_fn,
+                              batches=[(x, y)] * 4,
+                              warmup={"fresh": 20, "mismatched": 10},
+                              lr_by_kind={"fresh": 2.0}, verbose=False)
+    assert out["scheduler"] is not None, "应返回 warmup 调度器"
+    kinds = {g.get("plan_kind") for g in ob.param_groups}
+    # 加宽不会产生全新参数（全部是 partial / keep），所以断言"有需要特殊处理的组"
+    assert kinds - {tl.KIND_KEPT}, "应至少有一个非 kept 组: %s" % kinds
+
+    for _ in range(25):
+        loss = loss_fn(b, (x, y))
+        ob.zero_grad()
+        loss.backward()
+        ob.step()
+        out["scheduler"].step()
+    assert torch.isfinite(loss), "续训后 loss 应有限: %s" % loss.item()
+
+
+@case
+def test_resume_with_edit_creates_fresh_group():
+    """真的插了新层时，fresh 组必须出现，且预热后 lr 回升。"""
+    a = mlp([8, 16, 4])
+    oa = torch.optim.Adam(a.parameters(), lr=3e-3)
+    train_steps(a, oa, n=20)
+
+    b = tl.insert_after(a, "1", nn.Linear(16, 16).to(DEV))
+    ob = torch.optim.Adam(b.parameters(), lr=3e-3)
+
+    x = torch.randn(32, 8, device=DEV)
+    y = torch.randn(32, 4, device=DEV)
+
+    def loss_fn(mm, batch):
+        return ((mm(batch[0]) - batch[1]) ** 2).mean()
+
+    out = tl.resume_with_edit(a, oa, b, ob, loss_fn=loss_fn,
+                              batches=[(x, y)] * 3,
+                              warmup={"fresh": 30}, verbose=False)
+    kinds = {g.get("plan_kind") for g in ob.param_groups}
+    assert tl.KIND_FRESH in kinds, "插新层应产生 fresh 组: %s" % kinds
+
+    fresh = [g for g in ob.param_groups if g["plan_kind"] == tl.KIND_FRESH][0]
+    lr0 = fresh["lr"]
+    for _ in range(31):
+        out["scheduler"].step()
+    assert fresh["lr"] > lr0, "预热后 lr 应上升: %s -> %s" % (lr0, fresh["lr"])
+
+
 def main():
     print("torch_resume %s   设备: %s" % (tl.__version__, DEV))
     print("=" * 66)

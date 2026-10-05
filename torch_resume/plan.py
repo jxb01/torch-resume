@@ -10,6 +10,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 
+# 手术模块会在返回的模型上挂这个属性，记录"这次改动是有意的"。
+# diff 读它来决定重命名映射、以及哪些参数允许无条件切片继承。
+SURGERY_ATTR = "_torch_resume_surgery"
+
+
+def surgery_info(model: torch.nn.Module) -> Dict[str, object]:
+    """读取 surgery 模块记录的结构改动提示（没有就返回空）。"""
+    return dict(getattr(model, SURGERY_ATTR, None) or {})
+
+
 @dataclass
 class Action:
     name: str
@@ -25,6 +35,9 @@ class Action:
 class MigrationPlan:
     actions: List[Action] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # 预处理之后的旧权重（键已按手术记录重命名/复制）。
+    # apply_plan 必须用这一份，否则会找不到重命名后的键。
+    old_state: Optional[Dict[str, torch.Tensor]] = None
 
     def by_kind(self, kind: str) -> List[Action]:
         return [a for a in self.actions if a.kind == kind]
@@ -82,12 +95,51 @@ def _overlap_ratio(old: Sequence[int], new: Sequence[int]) -> float:
     return min(float(o) / float(n) for o, n in zip(old, new))
 
 
+def effective_old_state(
+    new_model: torch.nn.Module,
+    old_state: Dict[str, torch.Tensor],
+    *,
+    renames: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+    """按手术记录把旧 state_dict 的键调到新模型的名字上。
+
+    diff 和 apply_plan 都必须用这一份，否则重命名/复制过的键会两边对不上。
+    """
+    info = surgery_info(new_model)
+    if renames is None:
+        renames = dict(info.get("renames") or {})
+    copies = dict(info.get("copies") or {})
+    warnings: List[str] = []
+
+    out = dict(old_state)
+    if renames:
+        moved = 0
+        for old_n, new_n in renames.items():
+            if old_n in out and new_n not in out:
+                out[new_n] = out.pop(old_n)
+                moved += 1
+        if moved:
+            warnings.append("按手术记录重命名了 %d 个参数（显式映射，非猜测）" % moved)
+
+    if copies:
+        made = 0
+        for new_n, src_n in copies.items():
+            if src_n in out and new_n not in out:
+                out[new_n] = out[src_n].clone()
+                made += 1
+        if made:
+            warnings.append("按手术记录复制了 %d 份权重（扩深的份不是随机初始化）" % made)
+
+    return out, warnings
+
+
 def diff(
     new_model: torch.nn.Module,
     old_state: Dict[str, torch.Tensor],
     *,
     allow_rename: bool = False,
     partial_min_ratio: float = 0.5,
+    renames: Optional[Dict[str, str]] = None,
 ) -> MigrationPlan:
     """对比新模型与旧 state_dict，产出迁移计划。
 
@@ -96,8 +148,16 @@ def diff(
         partial_min_ratio: 做切片继承所需的最小重叠比例。
             0.5 表示重叠必须覆盖新形状的一半以上，否则宁可从零初始化。
             设为 0.0 可恢复"只要每维不小于就继承"的行为。
+        renames: 显式的 旧名 -> 新名 映射。不传则读模型中手术记录的那份。
     """
     plan = MigrationPlan()
+    info = surgery_info(new_model)
+    forced_partial = set(info.get("partial_ok") or [])
+
+    old_state, prep_warnings = effective_old_state(new_model, old_state, renames=renames)
+    plan.old_state = old_state
+    plan.warnings.extend(prep_warnings)
+
     new_all = dict(new_model.named_parameters())
     new_all.update(dict(new_model.named_buffers()))
 
@@ -113,11 +173,13 @@ def diff(
             else:
                 sl = _slice_for(old_shape, new_shape)
                 ratio = _overlap_ratio(old_shape, new_shape)
-                if sl is not None and ratio >= partial_min_ratio:
+                forced = name in forced_partial
+                if sl is not None and (forced or ratio >= partial_min_ratio):
+                    why = ("显式指定继承（手术记录）" if forced
+                           else "新形状更大，重叠 %.0f%%，可继承" % (ratio * 100))
                     plan.actions.append(Action(
-                        name, "partial",
-                        "新形状更大，重叠 %.0f%%，可继承" % (ratio * 100),
-                        old_shape, new_shape, source=name, slices=sl))
+                        name, "partial", why, old_shape, new_shape,
+                        source=name, slices=sl))
                 elif sl is not None:
                     plan.actions.append(Action(
                         name, "reset",

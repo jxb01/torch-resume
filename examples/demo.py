@@ -49,7 +49,7 @@ def loss_fn(m, batch):
     return ((m(xb) - yb) ** 2).mean()
 
 
-def train(model, opt, x, y, steps, tag="", log_every=None):
+def train(model, opt, x, y, steps, tag="", log_every=None, scheduler=None):
     model.train()
     last = None
     for i in range(steps):
@@ -57,9 +57,13 @@ def train(model, opt, x, y, steps, tag="", log_every=None):
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()      # 必须在 optimizer.step() 之后
         last = float(loss.item())
         if log_every and (i + 1) % log_every == 0:
-            print("  [%s] step %4d   loss %.6f" % (tag, i + 1, last))
+            lrs = "  ".join("%s=%.2e" % (g.get("plan_kind", "?"), g["lr"])
+                            for g in opt.param_groups)
+            print("  [%s] step %4d   loss %.6f   lr %s" % (tag, i + 1, last, lrs))
     return last
 
 
@@ -89,16 +93,17 @@ def main():
         tl.print_params(m1)
 
         # ---------------------------------------------------------- 3
-        banner("3a. 改结构：把隐藏层加宽 64 -> 128，改完直接续训")
-        m2 = nn.Sequential(
-            nn.Linear(20, 128), nn.ReLU(),
-            nn.Linear(128, 4),
-        ).to(DEV)
+        banner("3a. 改结构：tr.widen 把隐藏层加宽 64 -> 128，改完直接续训")
+        m2 = tl.widen(m1, "0", 128)          # 一行；旧的 m1 原样不动
+        print(tl.describe_surgery(m2))
         o2 = torch.optim.Adam(m2.parameters(), lr=3e-3)
 
-        out = tl.resume_with_edit(m1, o1, m2, o2,
-                                  loss_fn=loss_fn, batches=[(x, y)] * 4,
-                                  threshold=4.0, policy="threshold")
+        out = tl.resume_with_edit(
+            m1, o1, m2, o2,
+            loss_fn=loss_fn, batches=[(x, y)] * 4,
+            threshold=4.0, policy="threshold",
+            warmup={"fresh": 300, "mismatched": 200},
+            lr_by_kind={"fresh": 2.0})
         # 验证第一层确实继承了（必须在续训之前查，训练之后当然会变）
         # 加宽场景下形状从 (64,20) 变 (128,20)，所以要比较前 64 行
         w_old = m1[0].weight.detach()
@@ -108,16 +113,14 @@ def main():
               % (w_old.shape[0], "是" if same else "否"))
         assert same, "继承的行必须逐位相同"
 
-        loss_after = train(m2, o2, x, y, 200, tag="续训", log_every=100)
+        loss_after = train(m2, o2, x, y, 200, tag="续训", log_every=100,
+                           scheduler=out["scheduler"])
         print("  续训 200 步后 loss = %.6f" % loss_after)
         assert torch.isfinite(torch.tensor(loss_after)), "续训不应出现 NaN"
 
-        banner("3b. 对照：加一层（重叠太低 -> 宁可从零初始化）")
-        m2b = nn.Sequential(
-            nn.Linear(20, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 4),
-        ).to(DEV)
+        banner("3b. 对照：插一个新层（新参数从零初始化，走 fresh 预热）")
+        m2b = tl.insert_after(m1, "1", nn.Linear(64, 64).to(DEV))
+        print(tl.describe_surgery(m2b))
         old_sd = {k: v.detach().cpu() for k, v in m1.state_dict().items()}
         print(tl.diff(m2b, old_sd).report())
 
