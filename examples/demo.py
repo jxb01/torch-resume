@@ -132,6 +132,28 @@ def main():
         old_sd = {k: v.detach().cpu() for k, v in m1.state_dict().items()}
         print(tl.diff(m2b, old_sd).report())
 
+        # ---------------------------------------------------------- 3c
+        banner("3c. 改坏了就变回去（模型结构缓存）")
+        cache = tl.ModelCache(os.path.join(ckdir, "model_cache"), keep=5)
+        cache.save(m1, o1, tag="good", note="改动前那一版")
+        before = {k: v.detach().clone() for k, v in m1.state_dict().items()}
+        base = loss_fn(m1, (x, y)).item()
+        print("  存档时 loss = %.6f" % base)
+
+        # 真的把 m1 弄坏：用很大的 lr 继续训
+        o_bad = torch.optim.Adam(m1.parameters(), lr=0.5)
+        bad_loss = train(m1, o_bad, x, y, 200)
+        print("  用 lr=0.5 又训 200 步后 loss = %.6f（训坏了）" % bad_loss)
+        assert bad_loss > base, "前提：确实变差了"
+
+        print(cache.report())
+        m1, o1, info = cache.restore("good", m1, o1)
+        after = loss_fn(m1, (x, y)).item()
+        same = all(torch.equal(m1.state_dict()[k], before[k]) for k in before)
+        print("  回滚后 loss = %.6f   模式=%s" % (after, info["mode"]))
+        print("  权重是否逐位还原: %s" % ("是" if same else "否"))
+        assert same, "回滚必须逐位还原"
+
         # ---------------------------------------------------------- 4
         banner("4. 换 loss（尺度剧变）→ 先试算，再决定怎么处理")
         m3 = build(seed=1)

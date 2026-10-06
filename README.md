@@ -144,6 +144,51 @@ just migrated are still there.
 
 ---
 
+## Roll back a bad change
+
+A structure migration is a *hypothesis*. Sometimes it is worse. `state_dict` alone cannot save you —
+**it stores weights, not structure** — so the cache stores all three: structure, weights, and
+optimizer state.
+
+```python
+cache = tr.ModelCache("runs/exp1/model_cache")
+
+cache.save(model, opt, tag="good", note="before widening")
+
+bad = tr.widen(model, "0", 128)
+...train for a while, it is worse...
+
+model, opt, info = cache.restore("good", model, opt)   # back to where you were
+```
+
+```
+model structure cache  runs/exp1/model_cache
+========================================================================
+  good      10-06 22:42:01   1604 params  step -   val_loss=0.31  # before widening
+  wide      10-06 23:05:44   2884 params  step -   val_loss=0.48  # candidate
+------------------------------------------------------------------------
+  2 snapshots, 0.4 MB
+
+[model_cache] restored 'good' (in place, structures match)
+```
+
+**Three recovery modes, by reliability:**
+
+| | when | what happens |
+|---|---|---|
+| **in place** | target structure matches | `load_state_dict` — fastest, safest, the recommended path |
+| **rebuild** | structure differs | rehydrates the pickled model object (needs the class to be importable) |
+| **refuse** | pickling also unavailable | raises and prints the exact parameter diff — **it does not guess** |
+
+Use it with `resume_with_edit` and it saves the old model for you before touching anything:
+
+```python
+out = tr.resume_with_edit(old, old_opt, new, new_opt, cache=cache, ...)
+# out["snapshot"] is the auto-saved rollback point
+```
+
+---
+
 ## Four things that are not obvious
 
 **1. The optimizer state has to come along.**
@@ -190,13 +235,13 @@ classes to find, so the clone happens synchronously inside `step()` and only the
 git clone https://github.com/jxb01/torch-resume.git
 cd torch-resume
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-python tests/test_torch_resume.py     # 35 checks
+python tests/test_torch_resume.py     # 43 checks
 python examples/demo.py               # end-to-end demo
 ```
 
 Set `TORCH_RESUME_CPU=1` if you have no GPU.
 
-Verified locally: **35/35 passing** on torch 2.14.1+cu130, RTX 5060 (sm_120).
+Verified locally: **43/43 passing** on torch 2.14.1+cu130, RTX 5060 (sm_120), also green on Windows + Ubuntu CI.
 
 ---
 
@@ -204,15 +249,18 @@ Verified locally: **35/35 passing** on torch 2.14.1+cu130, RTX 5060 (sm_120).
 
 ```
 torch_resume/
+  _io.py        encoding-safe printing (Windows consoles are not UTF-8)
+  _store.py     atomic writes shared by checkpoints and the cache
   state.py      RNG snapshots, parameter-name maps, recursive cloning
   plan.py       structure diff -> migration plan (overlap floor + surgery records)
   migrate.py    apply the plan (weights + optimizer state)
   mismatch.py   mismatch detection (probe + per-parameter report + apply)
   groups.py     regroup by parameter kind + PlanWarmup scheduler
   surgery.py    widen / replace_module / insert_after / duplicate_layer
+  cache.py      structure + weights + optimizer state rollback
   checkpoint.py mandatory checkpoints
   inspect.py    pause / inspect / edit / resume_with_edit
-tests/test_torch_resume.py    35 checks
+tests/test_torch_resume.py    43 checks
 examples/demo.py              end-to-end demo
 ```
 

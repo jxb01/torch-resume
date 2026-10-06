@@ -502,6 +502,147 @@ def test_resume_with_edit_after_loss_change():
     assert rep.n_stall + rep.n_oscillate > 0, "应检测到失配: %s" % rep.report()
 
 
+# ------------------------------------------------------------------ 结构缓存
+
+@case
+def test_cache_save_and_rollback():
+    """真实场景：训了一段时间，存档，又训坏了，回滚。"""
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+        train_steps(a, oa, n=20)
+        good = {k: v.clone() for k, v in a.state_dict().items()}
+
+        cache = tl.ModelCache(d, verbose=False)
+        cache.save(a, oa, tag="v1", note="好的那一版", metrics={"val_loss": 0.5})
+
+        # 又训了很多步（模拟训坏了 / 改坏了）
+        train_steps(a, oa, n=60, seed=99)
+        changed = sum(1 for k in good
+                      if not torch.equal(a.state_dict()[k], good[k]))
+        assert changed > 0, "前提：继续训练后权重应当变了"
+
+        restored, opt, info = cache.restore("v1", a, oa)
+        assert info["mode"] == "inplace", info
+        for k in good:
+            assert torch.equal(restored.state_dict()[k], good[k]), k
+        assert oa.state, "优化器状态也应该回来"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case
+def test_cache_structure_mismatch_is_loud():
+    """结构不一致时必须报错并说清差异，不许静默乱塞。"""
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        cache = tl.ModelCache(d, verbose=False)
+        cache.save(a, tag="v1")
+        b = mlp([8, 32, 4])
+
+        try:
+            cache.restore("v1", b)
+            raise AssertionError("结构不一致时应当报错")
+        except ValueError as e:
+            assert "不一致" in str(e)
+            assert "0.weight" in str(e), "报错里应指出具体是哪个参数: %s" % e
+
+        # strict=False 时走重建
+        m, opt, info = cache.restore("v1", b, strict=False)
+        assert info["mode"] == "rebuild", info
+        assert m[0].weight.shape == (16, 8), "重建出来的应是存档里的结构"
+        assert opt is None, "重建路径下优化器要自己重建"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case
+def test_cache_record_and_report():
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        cache = tl.ModelCache(d, verbose=False)
+        assert "空的" in cache.report()
+        cache.save(a, tag="v1", note="初始")
+        b = tl.widen(a, "0", 32)
+        cache.save(b, tag="v2", note="加宽")
+        rep = cache.report()
+        assert "v1" in rep and "v2" in rep, rep
+        assert "加宽" in rep
+        assert len(cache.list()) == 2
+        # 手术记录也记下来了
+        snaps = {s.tag: s for s in cache.list()}
+        assert snaps["v2"].surgery.get("notes"), "手术记录应被保存"
+        # 结构对比
+        d2 = cache.diff("v1", "v2")
+        assert "参数量" in d2 and "0.weight" in d2, d2
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case
+def test_cache_retention():
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        cache = tl.ModelCache(d, keep=3, verbose=False)
+        for i in range(6):
+            cache.save(a, tag="v%02d" % i)
+        tags = [s.tag for s in cache.list()]
+        assert len(tags) == 3, tags
+        assert tags == ["v03", "v04", "v05"], tags
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case
+def test_resume_with_edit_autosaves():
+    """resume_with_edit 传了 cache 就自动存档 —— 忘记手动存也能回去。"""
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        oa = torch.optim.Adam(a.parameters(), lr=1e-3)
+        train_steps(a, oa, n=20)
+        good = {k: v.clone() for k, v in a.state_dict().items()}
+
+        cache = tl.ModelCache(d, verbose=False)
+        b = tl.widen(a, "0", 32)
+        ob = torch.optim.Adam(b.parameters(), lr=1e-3)
+        x = torch.randn(16, 8, device=DEV)
+        y = torch.randn(16, 4, device=DEV)
+
+        out = tl.resume_with_edit(a, oa, b, ob, cache=cache,
+                                  loss_fn=lambda m, bt: ((m(bt[0]) - bt[1]) ** 2).mean(),
+                                  batches=[(x, y)] * 2, verbose=False)
+        assert out["snapshot"] is not None, "应自动存档"
+        snaps = cache.list()
+        assert len(snaps) == 1 and "改动前" in snaps[0].note, snaps[0].note
+
+        # 用自动存档回滚
+        restored, _, _ = cache.restore(snaps[0].tag, a, oa)
+        for k in good:
+            assert torch.equal(restored.state_dict()[k], good[k]), k
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case
+def test_cache_weights_only():
+    d = tempfile.mkdtemp(prefix="tl_cache_")
+    try:
+        a = mlp([8, 16, 4])
+        train_steps(a, torch.optim.Adam(a.parameters(), lr=1e-3), n=5)
+        cache = tl.ModelCache(d, verbose=False)
+        cache.save(a, tag="v1")
+        sd = cache.load_weights_only("v1")
+        for k in a.state_dict():
+            assert torch.equal(sd[k], a.state_dict()[k].detach().cpu()), k
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ------------------------------------------------------------------ 输出编码
 
 @case

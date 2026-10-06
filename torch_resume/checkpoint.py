@@ -19,8 +19,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from .state import capture_rng, clone_tree, restore_rng
 from ._io import safe_print
+from ._store import atomic_torch_save as _atomic_torch_save
+from .state import capture_rng, clone_tree, restore_rng
 
 CKPT_EXT = ".ailck"
 WEIGHT_EXT = ".ailw"
@@ -311,8 +312,4 @@ def _unlink(p: Path) -> None:
         pass
 
 
-def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
-    """先写临时文件再 rename —— 写一半崩了也不会毁掉已有检查点。"""
-    tmp = path.with_name(path.name + ".tmp")
-    torch.save(payload, tmp)
-    os.replace(tmp, path)
+# 原子写盘实现在 ._store，缓存与检查点共用同一份。

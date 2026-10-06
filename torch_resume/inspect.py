@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -108,6 +109,8 @@ def resume_with_edit(
     lr_by_kind: Optional[Dict[str, float]] = None,
     base_lr: Optional[float] = None,
     start_factor: float = 0.1,
+    cache: Any = None,
+    cache_tag: Optional[str] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """改完结构 / 改完 loss 之后，一条命令接着训。
@@ -122,9 +125,17 @@ def resume_with_edit(
         warmup: {"fresh": 500, "mismatched": 200} —— 各类别预热多少步
         lr_by_kind: {"fresh": 2.0} —— 各类别相对基准 lr 的倍数
         base_lr: 基准 lr，默认取优化器当前的
+        cache: 传一个 ModelCache，会在动手之前自动存一份旧模型 —— **改坏了能变回去**
 
-    Returns: {"migrate", "mismatch", "scheduler", "groups"}
+    Returns: {"migrate", "mismatch", "scheduler", "groups", "snapshot"}
     """
+    snapshot = None
+    if cache is not None:
+        snapshot = cache.save(
+            old_model, old_optimizer,
+            tag=cache_tag or time.strftime("before-%Y%m%d-%H%M%S"),
+            note="resume_with_edit 之前（改动前的状态）")
+
     st: MigrateStats = migrate(
         new_model, new_optimizer, old_model, old_optimizer,
         allow_rename=allow_rename, partial_min_ratio=partial_min_ratio,
@@ -158,7 +169,7 @@ def resume_with_edit(
             safe_print("[提示] 训练循环里记得调用 scheduler.step()")
 
     return {"migrate": st, "mismatch": rep, "scheduler": sched,
-            "groups": new_optimizer.param_groups}
+            "groups": new_optimizer.param_groups, "snapshot": snapshot}
 
 
 # ---------------------------------------------------------------- 交互式

@@ -35,7 +35,7 @@ pip install git+https://github.com/jxb01/torch-resume.git
 
 ---
 
-## 五个能力
+## 六个能力
 
 | 模块 | 做什么 |
 |---|---|
@@ -45,6 +45,7 @@ pip install git+https://github.com/jxb01/torch-resume.git
 | `Inspector` / `pause` | 暂停、看每个参数的统计、直接改权重、冻结/解冻 |
 | `widen` / `replace_module` / `insert_after` / `duplicate_layer` | 模型手术：改结构不用重写模型 |
 | `retag_groups` / `PlanWarmup` | 按参数类别分组，对全新/失配的参数自动预热 |
+| `ModelCache` | 结构缓存：改之前存一份，改坏了能变回去 |
 | `resume_with_edit` | 上面几件事的一条命令版本 |
 
 ---
@@ -158,6 +159,48 @@ warmup 计划
 
 ---
 
+## 改坏了就变回去
+
+改结构是一个**假设**，有时它是错的。而 `state_dict` 救不了你 —— **它只存权重，不存结构**。
+所以缓存里存三样：结构、权重、优化器状态。
+
+```python
+cache = tr.ModelCache("runs/exp1/model_cache")
+
+cache.save(model, opt, tag="good", note="加宽之前那一版")
+
+bad = tr.widen(model, "0", 128)
+... 训一会，发现更差 ...
+
+model, opt, info = cache.restore("good", model, opt)   # 回到原来那一版
+```
+
+```
+模型结构缓存  runs/exp1/model_cache
+========================================================================
+  good      10-06 22:42:01   1604 参数  step -   val_loss=0.31  # 加宽之前
+  wide      10-06 23:05:44   2884 参数  step -   val_loss=0.48  # 候选
+------------------------------------------------------------------------
+  共 2 份，占用 0.4 MB
+```
+
+**三级恢复，按可靠性排：**
+
+| 模式 | 什么时候 | 做什么 |
+|---|---|---|
+| **inplace** | 目标结构一致 | `load_state_dict` —— 最快最稳，推荐路径 |
+| **rebuild** | 结构不一致 | 用存档里 pickle 的模型对象重建（要求那个类可反序列化） |
+| **拒绝** | 连对象也反序列化不了 | 报错并打印**逐参数的差异** —— **不猜** |
+
+和 `resume_with_edit` 一起用，它会在动手之前自动替你存档：
+
+```python
+out = tr.resume_with_edit(old, old_opt, new, new_opt, cache=cache, ...)
+# out["snapshot"] 就是自动存下的回滚点
+```
+
+---
+
 ## 四个不显然但重要的设计点
 
 **1. 优化器状态必须一起迁。**
@@ -200,7 +243,7 @@ beta2 = 0.999 时约 **1000 步**，期间它是"旧世界的统计量"。
 git clone https://github.com/jxb01/torch-resume.git
 cd torch-resume
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-python tests/test_torch_resume.py     # 35 项
+python tests/test_torch_resume.py     # 43 项
 python examples/demo.py               # 端到端演示
 ```
 
@@ -212,12 +255,15 @@ python examples/demo.py               # 端到端演示
 
 ```
 torch_resume/
+  _io.py         编码安全的打印（Windows 控制台不是 UTF-8）
+  _store.py      原子写盘，检查点与缓存共用
   state.py       RNG 快照、参数名映射、递归克隆
   plan.py        结构对比 -> 迁移计划（重叠比例门槛 + 手术记录）
   migrate.py     执行迁移（权重 + 优化器状态）
   mismatch.py    失配检测（试算 + 逐参数报告 + 处理）
   groups.py      按类别重新分组 + PlanWarmup 调度器
   surgery.py     widen / replace_module / insert_after / duplicate_layer
+  cache.py       结构 + 权重 + 优化器状态的存档与回滚
   checkpoint.py  强制检查点
   inspect.py     暂停 / 查看 / 修改 / resume_with_edit
 tests/test_torch_resume.py     35 项测试
